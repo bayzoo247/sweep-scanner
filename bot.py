@@ -2,7 +2,7 @@
 """
 Sweep & Reclaim Scanner — Discord Bot
 
-Scans top 100 Binance USDT pairs for liquidity sweep-and-reclaim setups.
+Scans top 150 Binance USDT pairs for liquidity sweep-and-reclaim setups.
 Posts alerts to a Discord channel with the reclaim price after candle close.
 
 Setup:
@@ -87,9 +87,9 @@ async def fetch_klines(symbol: str, interval: str, limit: int = 100) -> list:
     return await fetch_json(url)
 
 
-async def fetch_top100() -> list[str]:
+async def fetch_top150() -> list[str]:
     """
-    Fetch top 100 coins by volume. Tries three sources in order:
+    Fetch top 150 coins by volume. Tries three sources in order:
       1. CoinGecko  (free, no geo-blocking from datacenters)
       2. CoinCap    (free, no geo-blocking)
       3. Binance    (may be geo-blocked — HTTP 451)
@@ -99,7 +99,7 @@ async def fetch_top100() -> list[str]:
     try:
         cg_url = (
             "https://api.coingecko.com/api/v3/coins/markets"
-            "?vs_currency=usd&order=volume_desc&per_page=120&page=1"
+            "?vs_currency=usd&order=volume_desc&per_page=170&page=1"
         )
         async with session.get(cg_url) as resp:
             resp.raise_for_status()
@@ -109,7 +109,7 @@ async def fetch_top100() -> list[str]:
             sym = coin["symbol"].upper() + "USDT"
             if sym not in STABLECOIN_FILTER and sym not in symbols:
                 symbols.append(sym)
-            if len(symbols) >= 100:
+            if len(symbols) >= 150:
                 break
         if len(symbols) >= 50:
             print(f"CoinGecko: loaded {len(symbols)} USDT pairs")
@@ -119,7 +119,7 @@ async def fetch_top100() -> list[str]:
 
     # --- 2. CoinCap ---
     try:
-        cc_url = "https://api.coincap.io/v2/assets?limit=120"
+        cc_url = "https://api.coincap.io/v2/assets?limit=170"
         async with session.get(cc_url) as resp:
             resp.raise_for_status()
             cc_data = (await resp.json()).get("data", [])
@@ -128,7 +128,7 @@ async def fetch_top100() -> list[str]:
             sym = coin["symbol"].upper() + "USDT"
             if sym not in STABLECOIN_FILTER and sym not in symbols:
                 symbols.append(sym)
-            if len(symbols) >= 100:
+            if len(symbols) >= 150:
                 break
         if len(symbols) >= 50:
             print(f"CoinCap: loaded {len(symbols)} USDT pairs")
@@ -144,7 +144,7 @@ async def fetch_top100() -> list[str]:
                 if t["symbol"].endswith("USDT")
                 and t["symbol"] not in STABLECOIN_FILTER]
         usdt.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
-        symbols = [t["symbol"] for t in usdt[:100]]
+        symbols = [t["symbol"] for t in usdt[:150]]
         if symbols:
             print(f"Binance ticker: loaded {len(symbols)} USDT pairs")
             return symbols
@@ -526,10 +526,10 @@ async def on_ready():
 
     # Auto-load top 100 and start scanning
     try:
-        watchlist = await fetch_top100()
+        watchlist = await fetch_top150()
         print(f"Loaded {len(watchlist)} coins")
     except Exception as e:
-        print(f"Failed to load top 100: {e}")
+        print(f"Failed to load top 150: {e}")
         watchlist = [
             "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "BNBUSDT",
             "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
@@ -643,12 +643,12 @@ async def set_channel(ctx):
         await ctx.send(f"Scanner started — watching **{len(watchlist)}** coins on **{TIMEFRAME}**")
 
 
-@bot.command(name="top100")
-async def reload_top100(ctx):
-    """Reload the top 100 coins by volume."""
+@bot.command(name="top150")
+async def reload_top150(ctx):
+    """Reload the top 150 coins by volume."""
     global watchlist
     try:
-        watchlist = await fetch_top100()
+        watchlist = await fetch_top150()
         last_alert_key.clear()
         await ctx.send(f"Reloaded **{len(watchlist)}** top coins by volume — loading daily S/R levels...")
         await load_all_daily_sr(watchlist, ctx.channel)
@@ -660,7 +660,7 @@ async def reload_top100(ctx):
 async def show_watchlist(ctx):
     """Show current watchlist."""
     if not watchlist:
-        await ctx.send("Watchlist is empty. Use `!top100` to load.")
+        await ctx.send("Watchlist is empty. Use `!top150` to load.")
         return
     # Show in chunks to avoid message limit
     chunks = [watchlist[i:i+20] for i in range(0, len(watchlist), 20)]
@@ -761,7 +761,7 @@ async def show_commands(ctx):
         "**Sweep & Reclaim Scanner Commands:**\n\n"
         "`!setchannel` — Set this channel for alerts\n"
         "`!status` — Show scanner status\n"
-        "`!top100` — Reload top 100 coins by volume\n"
+        "`!top150` — Reload top 150 coins by volume\n"
         "`!watchlist` — Show current watchlist\n"
         "`!addcoin BTCUSDT, XRPUSDT` — Add coins\n"
         "`!removecoin DOGEUSDT` — Remove coins\n"
