@@ -38,7 +38,15 @@ STABLECOIN_FILTER = {
     "USD1USDT", "RLUSDUSDT", "EURUSDT", "GBPUSDT", "TRYUSDT",
 }
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_BASE = os.environ.get("BINANCE_BASE_URL", "https://api.binance.com")
+
+# Fallback endpoints if primary is geo-blocked (e.g. US servers)
+BINANCE_FALLBACKS = [
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
 
 # =====================================================================
 #  STATE
@@ -55,9 +63,23 @@ session: aiohttp.ClientSession | None = None
 #  BINANCE API
 # =====================================================================
 async def fetch_json(url: str) -> dict | list:
-    async with session.get(url) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    """Fetch JSON, trying fallback Binance mirrors if geo-blocked (HTTP 451/403)."""
+    try:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+    except aiohttp.ClientResponseError as e:
+        if e.status in (451, 403):
+            # Try fallback endpoints
+            for base in BINANCE_FALLBACKS:
+                try:
+                    fallback_url = url.replace(BINANCE_BASE, base)
+                    async with session.get(fallback_url) as resp2:
+                        resp2.raise_for_status()
+                        return await resp2.json()
+                except Exception:
+                    continue
+        raise
 
 
 async def fetch_klines(symbol: str, interval: str, limit: int = 100) -> list:
@@ -66,13 +88,83 @@ async def fetch_klines(symbol: str, interval: str, limit: int = 100) -> list:
 
 
 async def fetch_top100() -> list[str]:
-    url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
-    data = await fetch_json(url)
-    usdt = [t for t in data
-            if t["symbol"].endswith("USDT")
-            and t["symbol"] not in STABLECOIN_FILTER]
-    usdt.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
-    return [t["symbol"] for t in usdt[:100]]
+    """
+    Fetch top 100 coins by volume. Tries three sources in order:
+      1. CoinGecko  (free, no geo-blocking from datacenters)
+      2. CoinCap    (free, no geo-blocking)
+      3. Binance    (may be geo-blocked — HTTP 451)
+    If ALL fail, returns a hardcoded list of 50 major coins.
+    """
+    # --- 1. CoinGecko ---
+    try:
+        cg_url = (
+            "https://api.coingecko.com/api/v3/coins/markets"
+            "?vs_currency=usd&order=volume_desc&per_page=120&page=1"
+        )
+        async with session.get(cg_url) as resp:
+            resp.raise_for_status()
+            cg_data = await resp.json()
+        symbols = []
+        for coin in cg_data:
+            sym = coin["symbol"].upper() + "USDT"
+            if sym not in STABLECOIN_FILTER and sym not in symbols:
+                symbols.append(sym)
+            if len(symbols) >= 100:
+                break
+        if len(symbols) >= 50:
+            print(f"CoinGecko: loaded {len(symbols)} USDT pairs")
+            return symbols
+    except Exception as e:
+        print(f"CoinGecko failed: {e}")
+
+    # --- 2. CoinCap ---
+    try:
+        cc_url = "https://api.coincap.io/v2/assets?limit=120"
+        async with session.get(cc_url) as resp:
+            resp.raise_for_status()
+            cc_data = (await resp.json()).get("data", [])
+        symbols = []
+        for coin in cc_data:
+            sym = coin["symbol"].upper() + "USDT"
+            if sym not in STABLECOIN_FILTER and sym not in symbols:
+                symbols.append(sym)
+            if len(symbols) >= 100:
+                break
+        if len(symbols) >= 50:
+            print(f"CoinCap: loaded {len(symbols)} USDT pairs")
+            return symbols
+    except Exception as e:
+        print(f"CoinCap failed: {e}")
+
+    # --- 3. Binance (may 451) ---
+    try:
+        url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
+        data = await fetch_json(url)
+        usdt = [t for t in data
+                if t["symbol"].endswith("USDT")
+                and t["symbol"] not in STABLECOIN_FILTER]
+        usdt.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
+        symbols = [t["symbol"] for t in usdt[:100]]
+        if symbols:
+            print(f"Binance ticker: loaded {len(symbols)} USDT pairs")
+            return symbols
+    except Exception as e:
+        print(f"Binance ticker also failed: {e}")
+
+    # --- 4. Hardcoded top 50 (last resort) ---
+    print("All APIs failed — using hardcoded top 50 coins")
+    return [
+        "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "BNBUSDT",
+        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+        "TRXUSDT", "MATICUSDT", "SHIBUSDT", "LTCUSDT", "ATOMUSDT",
+        "NEARUSDT", "UNIUSDT", "BCHUSDT", "APTUSDT", "FILUSDT",
+        "ARBUSDT", "OPUSDT", "SUIUSDT", "INJUSDT", "TIAUSDT",
+        "SEIUSDT", "JUPUSDT", "WLDUSDT", "STXUSDT", "IMXUSDT",
+        "RENDERUSDT", "FETUSDT", "GRTUSDT", "AAVEUSDT", "MKRUSDT",
+        "ALGOUSDT", "FTMUSDT", "EGLDUSDT", "THETAUSDT", "AXSUSDT",
+        "SANDUSDT", "MANAUSDT", "GALAUSDT", "APEUSDT", "DYDXUSDT",
+        "ENAUSDT", "PENDLEUSDT", "WUSDT", "ONDOUSDT", "PEPEUSDT",
+    ]
 
 
 # =====================================================================
@@ -164,6 +256,103 @@ def detect_sweep_reclaim(klines: list) -> dict | None:
 
 
 # =====================================================================
+#  HTF TREND ALIGNMENT — 4H + Daily trend filter
+# =====================================================================
+def compute_ema(values: list[float], period: int) -> float:
+    """Compute EMA of the last `period` values. Returns the final EMA value."""
+    if len(values) < period:
+        return values[-1] if values else 0
+    k = 2 / (period + 1)
+    ema = values[0]
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+def read_trend(klines: list) -> dict:
+    """
+    Determine trend from klines using Price + EMA20/50 combo.
+    Returns {"direction": "BULLISH"/"BEARISH"/"NEUTRAL", "ema20": x, "ema50": x, "close": x}
+    """
+    if len(klines) < 52:
+        closes = [float(k[4]) for k in klines]
+        return {"direction": "NEUTRAL", "ema20": 0, "ema50": 0, "close": closes[-1] if closes else 0}
+
+    closes = [float(k[4]) for k in klines]
+    ema20 = compute_ema(closes, 20)
+    ema50 = compute_ema(closes, 50)
+    close = closes[-1]
+
+    if close > ema50 and ema20 > ema50:
+        direction = "BULLISH"
+    elif close < ema50 and ema20 < ema50:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    return {"direction": direction, "ema20": ema20, "ema50": ema50, "close": close}
+
+
+async def fetch_htf_trend(symbol: str) -> dict:
+    """
+    Fetch 4H and Daily candles, compute trend for each.
+    Returns {"h4": {...}, "daily": {...}, "alignment": str, "quality": str}
+    """
+    try:
+        h4_klines = await fetch_klines(symbol, "4h", 60)
+        h4_trend = read_trend(h4_klines)
+    except Exception:
+        h4_trend = {"direction": "NEUTRAL", "ema20": 0, "ema50": 0, "close": 0}
+
+    await asyncio.sleep(0.05)
+
+    try:
+        daily_klines = await fetch_klines(symbol, "1d", 60)
+        daily_trend = read_trend(daily_klines)
+    except Exception:
+        daily_trend = {"direction": "NEUTRAL", "ema20": 0, "ema50": 0, "close": 0}
+
+    return {"h4": h4_trend, "daily": daily_trend}
+
+
+def grade_htf_alignment(signal_direction: str, htf: dict) -> dict:
+    """
+    Grade how well the signal aligns with higher timeframes.
+
+    Returns {"alignment": str, "quality": str, "h4_dir": str, "daily_dir": str}
+      alignment: "HTF Aligned" / "Partial Align" / "Counter-Trend"
+      quality:   "A+" / "A" / "B" / "C"
+    """
+    # Signal is BULLISH or BEARISH
+    is_bull = signal_direction == "BULLISH"
+    h4_dir = htf["h4"]["direction"]
+    daily_dir = htf["daily"]["direction"]
+
+    # What counts as "with trend" for this signal
+    with_trend = "BULLISH" if is_bull else "BEARISH"
+    against_trend = "BEARISH" if is_bull else "BULLISH"
+
+    h4_aligned = h4_dir == with_trend
+    h4_against = h4_dir == against_trend
+    daily_aligned = daily_dir == with_trend
+    daily_against = daily_dir == against_trend
+
+    # Grade the alignment
+    if h4_aligned and daily_aligned:
+        return {"alignment": "HTF Aligned", "quality": "A+",
+                "h4_dir": h4_dir, "daily_dir": daily_dir}
+    elif h4_aligned and not daily_against:
+        return {"alignment": "HTF Aligned", "quality": "A",
+                "h4_dir": h4_dir, "daily_dir": daily_dir}
+    elif not h4_against and not daily_against:
+        return {"alignment": "Partial Align", "quality": "B",
+                "h4_dir": h4_dir, "daily_dir": daily_dir}
+    else:
+        return {"alignment": "Counter-Trend", "quality": "C",
+                "h4_dir": h4_dir, "daily_dir": daily_dir}
+
+
+# =====================================================================
 #  DAILY S/R LEVELS — Only fire alerts near proven daily zones
 # =====================================================================
 async def fetch_daily_sr(symbol: str) -> dict | None:
@@ -236,18 +425,52 @@ def fmt_vol(v: float) -> str:
 def build_embed(symbol: str, result: dict) -> discord.Embed:
     """Build a Discord embed for a sweep & reclaim alert."""
     is_bull = result["direction"] == "BULLISH"
-    color = 0x3fb950 if is_bull else 0xf85149
+    quality = result.get("htf_quality", "")
+
+    # Color based on alignment quality
+    if quality == "C":
+        color = 0xf0ad4e  # amber for counter-trend
+    else:
+        color = 0x3fb950 if is_bull else 0xf85149
+
     emoji = "\U0001f7e2" if is_bull else "\U0001f534"
     arrow = "▲" if is_bull else "▼"
+
+    # Quality badge in title
+    quality_badge = f" [{quality}]" if quality else ""
+    alignment = result.get("htf_alignment", "")
+    align_icon = {"HTF Aligned": "✅", "Partial Align": "🔶", "Counter-Trend": "⚠️"}.get(alignment, "")
 
     level = result["level"]
     reclaim_pct = abs(result["close"] - level) / level * 100
 
     embed = discord.Embed(
-        title=f"{emoji} {symbol} — {result['direction']} Sweep & Reclaim",
+        title=f"{emoji} {symbol} — {result['direction']} Sweep & Reclaim{quality_badge}",
         color=color,
         timestamp=datetime.utcnow(),
     )
+
+    # --- HTF Alignment section (top of embed) ---
+    if alignment:
+        h4_dir = result.get("h4_dir", "?")
+        daily_dir = result.get("daily_dir", "?")
+        h4_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(h4_dir, "⚪")
+        daily_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(daily_dir, "⚪")
+
+        htf_text = (
+            f"{align_icon} **{alignment}**\n"
+            f"{h4_icon} 4H: {h4_dir}  •  {daily_icon} Daily: {daily_dir}"
+        )
+        embed.add_field(name="HTF Trend", value=htf_text, inline=False)
+
+    # --- EMA50 confluence ---
+    if result.get("ema50_confluence"):
+        embed.add_field(
+            name="EMA50 Confluence",
+            value=result["ema50_confluence"],
+            inline=True,
+        )
+
     embed.add_field(
         name=f"{arrow} Liquidity Level",
         value=f"**{fmt_price(level)}**",
@@ -256,11 +479,6 @@ def build_embed(symbol: str, result: dict) -> discord.Embed:
     embed.add_field(
         name="Swept To",
         value=fmt_price(result["swept"]),
-        inline=True,
-    )
-    embed.add_field(
-        name="​",  # spacer
-        value="​",
         inline=True,
     )
     embed.add_field(
@@ -288,7 +506,7 @@ def build_embed(symbol: str, result: dict) -> discord.Embed:
         value=TIMEFRAME,
         inline=True,
     )
-    embed.set_footer(text="Sweep & Reclaim Scanner • Daily S/R + Volume Filtered")
+    embed.set_footer(text="Sweep & Reclaim Scanner • HTF Aligned + Daily S/R + Volume")
     return embed
 
 
@@ -366,6 +584,27 @@ async def scan_loop():
                 # Enrich result with the daily S/R match
                 result["daily_type"] = match["type"]
                 result["daily_level"] = match["daily_level"]
+
+                # --- HTF Trend Alignment ---
+                try:
+                    htf = await fetch_htf_trend(symbol)
+                    grade = grade_htf_alignment(result["direction"], htf)
+                    result["htf_alignment"] = grade["alignment"]
+                    result["htf_quality"] = grade["quality"]
+                    result["h4_dir"] = grade["h4_dir"]
+                    result["daily_dir"] = grade["daily_dir"]
+
+                    # EMA50 confluence check (is the swept level near the 4H EMA50?)
+                    ema50_4h = htf["h4"]["ema50"]
+                    if ema50_4h > 0:
+                        ema_dist = abs(result["level"] - ema50_4h) / ema50_4h
+                        if ema_dist <= 0.01:  # within 1%
+                            result["ema50_confluence"] = f"✅ Level at 4H EMA50 ({fmt_price(ema50_4h)})"
+                        elif ema_dist <= 0.02:
+                            result["ema50_confluence"] = f"Near 4H EMA50 ({fmt_price(ema50_4h)})"
+                except Exception:
+                    result["htf_alignment"] = "Unknown"
+                    result["htf_quality"] = "?"
 
                 # Dedup: only alert once per symbol+direction+level
                 alert_key = f"{symbol}_{result['direction']}_{result['level']:.6f}"
